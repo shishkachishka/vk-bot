@@ -48,9 +48,8 @@ type UserSession struct {
 }
 
 var (
-	sessions    = make(map[int64]*UserSession)
-	lastMsgTime = make(map[int64]time.Time)
-	processing  = make(map[int64]bool)
+	sessions        = make(map[int64]*UserSession)
+	processedMsgIDs = make(map[int64]int)
 )
 
 func genID() string {
@@ -126,21 +125,20 @@ func getMainMenu() string {
 		"8️⃣ Привязать Telegram"
 }
 
-func handleMessage(vk *api.VK, userID int64, text string) {
+func handleMessage(vk *api.VK, obj events.MessageNewObject) {
+	userID := int64(obj.Message.PeerID)
+	text := obj.Message.Text
+	msgID := obj.Message.ID
+
 	if text == "" {
 		return
 	}
 
-	// Защита от дублей
-	if processing[userID] {
+	// Защита от дублей по ID сообщения
+	if processedMsgIDs[userID] == msgID {
 		return
 	}
-	if time.Since(lastMsgTime[userID]) < 3*time.Second {
-		return
-	}
-	processing[userID] = true
-	lastMsgTime[userID] = time.Now()
-	defer func() { processing[userID] = false }()
+	processedMsgIDs[userID] = msgID
 
 	if sessions[userID] == nil {
 		storage := loadFromAPI(userID)
@@ -159,7 +157,7 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 	}
 	session := sessions[userID]
 
-	// Всегда загружаем свежие данные из Telegram если привязан
+	// Всегда загружаем свежие данные из Telegram
 	if session.storage.TelegramID > 0 && session.IsLoggedIn {
 		fresh := loadByTelegramID(session.storage.TelegramID)
 		if fresh != nil && len(fresh.MasterHash) > 0 {
@@ -337,9 +335,7 @@ func main() {
 	}
 
 	lp.MessageNew(func(ctx context.Context, obj events.MessageNewObject) {
-		userID := int64(obj.Message.PeerID)
-		text := obj.Message.Text
-		handleMessage(vk, userID, text)
+		handleMessage(vk, obj)
 	})
 
 	log.Println("ВК бот запущен")
