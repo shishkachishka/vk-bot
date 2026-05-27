@@ -50,6 +50,7 @@ type UserSession struct {
 var (
 	sessions    = make(map[int64]*UserSession)
 	lastMsgTime = make(map[int64]time.Time)
+	processing  = make(map[int64]bool)
 )
 
 func genID() string {
@@ -62,10 +63,6 @@ func genID() string {
 }
 
 func loadFromAPI(userID int64) *Storage {
-	if sessions[userID] != nil && sessions[userID].storage.TelegramID > 0 {
-		userID = sessions[userID].storage.TelegramID
-	}
-
 	url := fmt.Sprintf("%s/api/vk/load?id=%d", apiURL, userID)
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Get(url)
@@ -134,25 +131,43 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 		return
 	}
 
-	// Жёсткая защита от дублей — 2 секунды между обработками
-	if time.Since(lastMsgTime[userID]) < 2*time.Second {
+	// Защита от дублей
+	if processing[userID] {
 		return
 	}
+	if time.Since(lastMsgTime[userID]) < 3*time.Second {
+		return
+	}
+	processing[userID] = true
 	lastMsgTime[userID] = time.Now()
+	defer func() { processing[userID] = false }()
 
 	if sessions[userID] == nil {
+		storage := loadFromAPI(userID)
+		if storage.TelegramID > 0 {
+			tgStorage := loadByTelegramID(storage.TelegramID)
+			if tgStorage != nil && len(tgStorage.MasterHash) > 0 {
+				tgID := storage.TelegramID
+				storage = tgStorage
+				storage.TelegramID = tgID
+			}
+		}
 		sessions[userID] = &UserSession{
 			UserID:  userID,
-			storage: loadFromAPI(userID),
-		}
-		if sessions[userID].storage.TelegramID > 0 {
-			tgStorage := loadByTelegramID(sessions[userID].storage.TelegramID)
-			if tgStorage != nil && len(tgStorage.MasterHash) > 0 {
-				sessions[userID].storage = tgStorage
-			}
+			storage: storage,
 		}
 	}
 	session := sessions[userID]
+
+	// Всегда загружаем свежие данные из Telegram если привязан
+	if session.storage.TelegramID > 0 && session.IsLoggedIn {
+		fresh := loadByTelegramID(session.storage.TelegramID)
+		if fresh != nil && len(fresh.MasterHash) > 0 {
+			tgID := session.storage.TelegramID
+			session.storage = fresh
+			session.storage.TelegramID = tgID
+		}
+	}
 
 	if session.waitingForTG {
 		session.waitingForTG = false
@@ -254,12 +269,6 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 		return
 
 	case "2", "2️⃣":
-		if session.storage.TelegramID > 0 {
-			fresh := loadByTelegramID(session.storage.TelegramID)
-			if fresh != nil {
-				session.storage = fresh
-			}
-		}
 		if len(session.storage.Passwords) == 0 {
 			sendMessage(vk, userID, "📭 Пусто\n\n"+getMainMenu())
 			return
@@ -332,7 +341,7 @@ func main() {
 		text := obj.Message.Text
 		handleMessage(vk, userID, text)
 	})
-	//выаыв
+
 	log.Println("ВК бот запущен")
 	if err := lp.Run(); err != nil {
 		log.Fatal(err)
