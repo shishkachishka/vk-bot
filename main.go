@@ -332,7 +332,7 @@ func main() {
 		text := obj.Message.Text
 		handleMessage(vk, userID, text)
 	})
-
+	//выаыв
 	log.Println("ВК бот запущен")
 	if err := lp.Run(); err != nil {
 		log.Fatal(err)
