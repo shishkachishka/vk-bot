@@ -49,7 +49,7 @@ type UserSession struct {
 
 var (
 	sessions    = make(map[int64]*UserSession)
-	lastMessage = make(map[int64]string)
+	lastMsgTime = make(map[int64]time.Time)
 )
 
 func genID() string {
@@ -62,6 +62,11 @@ func genID() string {
 }
 
 func loadFromAPI(userID int64) *Storage {
+	// Если привязан Telegram — загружаем по Telegram ID
+	if sessions[userID] != nil && sessions[userID].storage.TelegramID > 0 {
+		userID = sessions[userID].storage.TelegramID
+	}
+
 	url := fmt.Sprintf("%s/api/vk/load?id=%d", apiURL, userID)
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Get(url)
@@ -130,11 +135,11 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 		return
 	}
 
-	// Анти-дубль
-	if lastMessage[userID] == text {
+	// Защита от дублей — игнорируем сообщения чаще 1 раза в секунду
+	if time.Since(lastMsgTime[userID]) < time.Second {
 		return
 	}
-	lastMessage[userID] = text
+	lastMsgTime[userID] = time.Now()
 
 	if sessions[userID] == nil {
 		sessions[userID] = &UserSession{
@@ -250,6 +255,13 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 		return
 
 	case "2", "2️⃣":
+		// Загружаем свежие данные перед показом списка
+		if session.storage.TelegramID > 0 {
+			fresh := loadByTelegramID(session.storage.TelegramID)
+			if fresh != nil {
+				session.storage = fresh
+			}
+		}
 		if len(session.storage.Passwords) == 0 {
 			sendMessage(vk, userID, "📭 Пусто\n\n"+getMainMenu())
 			return
