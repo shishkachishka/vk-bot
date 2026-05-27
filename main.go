@@ -49,7 +49,7 @@ type UserSession struct {
 
 var (
 	sessions    = make(map[int64]*UserSession)
-	lastMsgTime = make(map[int64]time.Time)
+	lastMessage = make(map[int64]string)
 )
 
 func genID() string {
@@ -62,7 +62,6 @@ func genID() string {
 }
 
 func loadFromAPI(userID int64) *Storage {
-	// Если привязан Telegram — загружаем по Telegram ID
 	if sessions[userID] != nil && sessions[userID].storage.TelegramID > 0 {
 		userID = sessions[userID].storage.TelegramID
 	}
@@ -135,11 +134,11 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 		return
 	}
 
-	// Защита от дублей — игнорируем сообщения чаще 1 раза в секунду
-	if time.Since(lastMsgTime[userID]) < time.Second {
+	// Анти-дубль
+	if lastMessage[userID] == text {
 		return
 	}
-	lastMsgTime[userID] = time.Now()
+	lastMessage[userID] = text
 
 	if sessions[userID] == nil {
 		sessions[userID] = &UserSession{
@@ -255,7 +254,6 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 		return
 
 	case "2", "2️⃣":
-		// Загружаем свежие данные перед показом списка
 		if session.storage.TelegramID > 0 {
 			fresh := loadByTelegramID(session.storage.TelegramID)
 			if fresh != nil {
