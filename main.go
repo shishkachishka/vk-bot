@@ -47,7 +47,10 @@ type UserSession struct {
 	waitingForTG   bool
 }
 
-var sessions = make(map[int64]*UserSession)
+var (
+	sessions    = make(map[int64]*UserSession)
+	lastMessage = make(map[int64]string)
+)
 
 func genID() string {
 	const letters = "abcdef0123456789"
@@ -73,7 +76,11 @@ func loadFromAPI(userID int64) *Storage {
 }
 
 func saveToAPI(userID int64, storage *Storage) {
-	url := fmt.Sprintf("%s/api/vk/save?id=%d", apiURL, userID)
+	saveID := userID
+	if storage.TelegramID > 0 {
+		saveID = storage.TelegramID
+	}
+	url := fmt.Sprintf("%s/api/vk/save?id=%d", apiURL, saveID)
 	data, _ := json.Marshal(storage)
 	client := &http.Client{Timeout: 30 * time.Second}
 	req, _ := http.NewRequest("POST", url, bytes.NewReader(data))
@@ -119,20 +126,30 @@ func getMainMenu() string {
 }
 
 func handleMessage(vk *api.VK, userID int64, text string) {
-	// Игнорируем пустые сообщения
 	if text == "" {
 		return
 	}
+
+	// Анти-дубль
+	if lastMessage[userID] == text {
+		return
+	}
+	lastMessage[userID] = text
 
 	if sessions[userID] == nil {
 		sessions[userID] = &UserSession{
 			UserID:  userID,
 			storage: loadFromAPI(userID),
 		}
+		if sessions[userID].storage.TelegramID > 0 {
+			tgStorage := loadByTelegramID(sessions[userID].storage.TelegramID)
+			if tgStorage != nil && len(tgStorage.MasterHash) > 0 {
+				sessions[userID].storage = tgStorage
+			}
+		}
 	}
 	session := sessions[userID]
 
-	// Ожидание ввода Telegram ID
 	if session.waitingForTG {
 		session.waitingForTG = false
 		tgID, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
@@ -141,26 +158,22 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 			session.waitingForTG = true
 			return
 		}
-
 		session.storage.TelegramID = tgID
 		saveToAPI(userID, session.storage)
 		sendMessage(vk, userID, fmt.Sprintf("✅ Telegram ID %d привязан!\n⚠️ Удалите сообщение с ID из чата!\n\n%s", tgID, getMainMenu()))
 		return
 	}
 
-	// НЕ авторизован
 	if !session.IsLoggedIn {
-		// Команда "Начать"
 		if text == "Начать" || text == "/start" || text == "start" {
-			msg := fmt.Sprintf("🔐 Менеджер паролей\n\n🆔 Ваш VK ID: %d\n\nВведите мастер-пароль (мин. 12 символов).\nНет аккаунта? Просто придумайте новый пароль.", userID)
+			msg := fmt.Sprintf("🔐 Менеджер паролей\n\n🆔 Ваш VK ID: %d\n\nВведите мастер-пароль для входа.\nЕсли у вас нет аккаунта — просто придумайте новый пароль (мин. 12 символов).", userID)
 			sendMessage(vk, userID, msg)
 			return
 		}
 
-		// Новый аккаунт (нет MasterHash)
 		if len(session.storage.MasterHash) == 0 {
 			if len(text) < 12 {
-				sendMessage(vk, userID, "❌ Минимум 12 символов!")
+				sendMessage(vk, userID, "❌ Пароль должен быть минимум 12 символов! Введите новый пароль:")
 				return
 			}
 			session.storage.MasterHash = "vk-" + text
@@ -171,7 +184,6 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 			return
 		}
 
-		// Вход существующего аккаунта
 		if session.storage.MasterHash == "vk-"+text {
 			session.IsLoggedIn = true
 			sendMessage(vk, userID, "✅ Вход выполнен!\n⚠️ Удалите сообщение с паролем!\n\n"+getMainMenu())
@@ -182,7 +194,6 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 		return
 	}
 
-	// АВТОРИЗОВАН — обрабатываем состояния
 	switch {
 	case session.waitingForPass:
 		if session.addingNote == "" {
@@ -190,7 +201,6 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 			sendMessage(vk, userID, "🔒 Введите пароль:")
 			return
 		}
-		// Сохраняем пароль
 		password := text
 		entry := PasswordEntry{
 			ID:        genID(),
@@ -232,7 +242,6 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 		return
 	}
 
-	// Обработка команд меню
 	switch text {
 	case "1", "1️⃣":
 		session.waitingForPass = true
