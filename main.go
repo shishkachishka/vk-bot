@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +32,7 @@ type PasswordEntry struct {
 type Storage struct {
 	MasterHash string          `json:"master_hash"`
 	MasterSalt string          `json:"master_salt"`
+	TelegramID int64           `json:"telegram_id"` // ← новое поле
 	Passwords  []PasswordEntry `json:"passwords"`
 }
 
@@ -42,6 +44,7 @@ type UserSession struct {
 	waitingForPass bool
 	waitingForGet  bool
 	waitingForDel  bool
+	waitingForTG   bool // ← ждем Telegram ID
 }
 
 var sessions = make(map[int64]*UserSession)
@@ -78,6 +81,24 @@ func saveToAPI(userID int64, storage *Storage) {
 	client.Do(req)
 }
 
+// Загрузка по Telegram ID
+func loadByTelegramID(tgID int64) *Storage {
+	url := fmt.Sprintf("%s/api/vk/load?id=%d", apiURL, tgID)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil || resp.StatusCode != 200 {
+		return nil
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	var storage Storage
+	json.Unmarshal(data, &storage)
+	if len(storage.MasterHash) > 0 {
+		return &storage
+	}
+	return nil
+}
+
 func sendMessage(vk *api.VK, userID int64, text string) {
 	msg := params.NewMessagesSendBuilder()
 	msg.PeerID(int(userID))
@@ -87,7 +108,7 @@ func sendMessage(vk *api.VK, userID int64, text string) {
 }
 
 func getMainMenu() string {
-	return "📋 Меню:\n" +
+	menu := "📋 Меню:\n" +
 		"1️⃣ Добавить пароль\n" +
 		"2️⃣ Список\n" +
 		"3️⃣ Получить пароль\n" +
@@ -95,6 +116,13 @@ func getMainMenu() string {
 		"5️⃣ Мой ID\n" +
 		"6️⃣ Инструкция\n" +
 		"7️⃣ Выйти"
+
+	// Если не привязан Telegram — показываем доп. пункт
+	return menu
+}
+
+func getFullMenu() string {
+	return getMainMenu() + "\n8️⃣ Привязать Telegram"
 }
 
 func handleMessage(vk *api.VK, userID int64, text string) {
@@ -106,10 +134,40 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 	}
 	session := sessions[userID]
 
+	// Обработка ввода Telegram ID
+	if session.waitingForTG {
+		session.waitingForTG = false
+		tgID, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
+		if err != nil || tgID <= 0 {
+			sendMessage(vk, userID, "❌ Неверный ID. Введите число.")
+			return
+		}
+
+		// Пробуем загрузить данные по Telegram ID
+		tgStorage := loadByTelegramID(tgID)
+		if tgStorage != nil {
+			// Проверяем мастер-пароль
+			sendMessage(vk, userID, "✅ Telegram найден! Введите мастер-пароль от Telegram-аккаунта:")
+			session.storage = tgStorage
+			session.storage.TelegramID = tgID
+			session.IsLoggedIn = false // нужно будет ввести пароль
+			return
+		}
+
+		// Если нет — сохраняем Telegram ID в текущий аккаунт
+		session.storage.TelegramID = tgID
+		saveToAPI(userID, session.storage)
+		sendMessage(vk, userID, fmt.Sprintf("✅ Telegram ID %d привязан!\n\n%s", tgID, getMainMenu()))
+		return
+	}
+
 	if !session.IsLoggedIn {
 		if text == "Начать" || text == "/start" || text == "start" {
-			sendMessage(vk, userID,
-				fmt.Sprintf("🔐 Менеджер паролей\n\n🆔 Ваш ID: %d\n\nОтправьте мастер-пароль для входа.\nНет аккаунта? Введите новый пароль (мин. 12 символов).", userID))
+			msg := fmt.Sprintf("🔐 Менеджер паролей\n\n🆔 Ваш VK ID: %d\n\nОтправьте мастер-пароль для входа.\nНет аккаунта? Введите новый пароль (мин. 12 символов).", userID)
+			if session.storage.TelegramID > 0 {
+				msg += fmt.Sprintf("\n📱 Привязан Telegram ID: %d", session.storage.TelegramID)
+			}
+			sendMessage(vk, userID, msg)
 			return
 		}
 
@@ -128,6 +186,16 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 
 		if session.storage.MasterHash == "vk-"+text {
 			session.IsLoggedIn = true
+			// Если привязан Telegram — синхронизируем
+			if session.storage.TelegramID > 0 {
+				tgStorage := loadByTelegramID(session.storage.TelegramID)
+				if tgStorage != nil && len(tgStorage.Passwords) > 0 {
+					session.storage.Passwords = tgStorage.Passwords
+					saveToAPI(userID, session.storage)
+					sendMessage(vk, userID, fmt.Sprintf("✅ Вход выполнен!\n📱 Синхронизировано с Telegram!\n\n%s", getMainMenu()))
+					return
+				}
+			}
 			sendMessage(vk, userID, "✅ Вход выполнен!\n\n"+getMainMenu())
 		} else {
 			sendMessage(vk, userID, "❌ Неверный пароль!")
@@ -150,7 +218,12 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 			CreatedAt: time.Now().Format("02.01.2006 15:04"),
 		}
 		session.storage.Passwords = append(session.storage.Passwords, entry)
-		saveToAPI(userID, session.storage)
+		// Сохраняем под Telegram ID если привязан
+		saveID := userID
+		if session.storage.TelegramID > 0 {
+			saveID = session.storage.TelegramID
+		}
+		saveToAPI(saveID, session.storage)
 		sendMessage(vk, userID, fmt.Sprintf("✅ '%s' сохранен! ID: %s\n\n%s", entry.Note, entry.ID, getMainMenu()))
 		session.addingNote = ""
 		session.waitingForPass = false
@@ -174,7 +247,11 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 		for i, e := range session.storage.Passwords {
 			if e.ID == id {
 				session.storage.Passwords = append(session.storage.Passwords[:i], session.storage.Passwords[i+1:]...)
-				saveToAPI(userID, session.storage)
+				saveID := userID
+				if session.storage.TelegramID > 0 {
+					saveID = session.storage.TelegramID
+				}
+				saveToAPI(saveID, session.storage)
 				sendMessage(vk, userID, fmt.Sprintf("🗑 '%s' удален!\n\n%s", e.Note, getMainMenu()))
 				return
 			}
@@ -214,16 +291,25 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 		return
 
 	case text == "5" || text == "5️⃣":
-		sendMessage(vk, userID, fmt.Sprintf("🆔 Ваш ID: %d\n\n%s", userID, getMainMenu()))
+		msg := fmt.Sprintf("🆔 Ваш VK ID: %d", userID)
+		if session.storage.TelegramID > 0 {
+			msg += fmt.Sprintf("\n📱 Привязан Telegram ID: %d", session.storage.TelegramID)
+		}
+		sendMessage(vk, userID, msg+"\n\n"+getMainMenu())
 		return
 
 	case text == "6" || text == "6️⃣":
-		sendMessage(vk, userID, "📘 Инструкция:\n\n1️⃣ Добавить\n2️⃣ Список\n3️⃣ Получить\n4️⃣ Удалить\n5️⃣ ID\n7️⃣ Выйти\n\n"+getMainMenu())
+		sendMessage(vk, userID, "📘 Инструкция:\n\n1️⃣ Добавить\n2️⃣ Список\n3️⃣ Получить\n4️⃣ Удалить\n5️⃣ ID\n8️⃣ Привязать Telegram\n7️⃣ Выйти\n\n"+getMainMenu())
 		return
 
 	case text == "7" || text == "7️⃣":
 		delete(sessions, userID)
 		sendMessage(vk, userID, "👋 Вы вышли. Напишите 'Начать' для входа.")
+		return
+
+	case text == "8" || text == "8️⃣":
+		session.waitingForTG = true
+		sendMessage(vk, userID, "📱 Введите ваш Telegram ID (узнать в боте @passwordmebot командой /myid):")
 		return
 
 	default:
@@ -239,7 +325,6 @@ func main() {
 
 	vk := api.NewVK(token)
 
-	// Используем ID группы из переменной окружения
 	groupID := 0
 	fmt.Sscanf(os.Getenv("VK_GROUP_ID"), "%d", &groupID)
 	if groupID == 0 {
