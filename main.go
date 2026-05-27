@@ -49,7 +49,7 @@ type UserSession struct {
 
 var (
 	sessions    = make(map[int64]*UserSession)
-	lastMessage = make(map[int64]string)
+	lastMsgTime = make(map[int64]time.Time)
 )
 
 func genID() string {
@@ -134,11 +134,11 @@ func handleMessage(vk *api.VK, userID int64, text string) {
 		return
 	}
 
-	// Анти-дубль
-	if lastMessage[userID] == text {
+	// Жёсткая защита от дублей — 2 секунды между обработками
+	if time.Since(lastMsgTime[userID]) < 2*time.Second {
 		return
 	}
-	lastMessage[userID] = text
+	lastMsgTime[userID] = time.Now()
 
 	if sessions[userID] == nil {
 		sessions[userID] = &UserSession{
